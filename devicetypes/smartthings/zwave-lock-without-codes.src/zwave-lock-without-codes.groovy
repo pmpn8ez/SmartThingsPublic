@@ -23,9 +23,11 @@ metadata {
 		capability "Health Check"
 		capability "Configuration"
 
+		fingerprint inClusters: "0x62"
 		fingerprint mfr: "010E", prod: "0009", model: "0001", deviceJoinName: "Danalock V3 Smart Lock"
 		fingerprint mfr: "0090", prod: "0003", model: "0446", deviceJoinName: "Kwikset Convert Deadbolt Door Lock" //99140
 		fingerprint mfr: "033F", prod: "0001", model: "0001", deviceJoinName: "August Smart Lock Pro"
+		fingerprint mfr: "021D", prod: "0003", model: "0001", deviceJoinName: "Alfred Smart Home Touchscreen Deadbolt" // DB2
 	}
 
 	simulator {
@@ -61,6 +63,22 @@ metadata {
 }
 
 import physicalgraph.zwave.commands.doorlockv1.*
+
+/**
+ * Mapping of command classes and associated versions used for this DTH
+ */
+private getCommandClassVersions() {
+	[
+		0x62: 1,  // Door Lock
+		0x63: 1,  // User Code
+		0x71: 2,  // Alarm
+		0x72: 2,  // Manufacturer Specific
+		0x80: 1,  // Battery
+		0x85: 2,  // Association
+		0x86: 1,  // Version
+		0x98: 1   // Security 0
+	]
+}
 
 /**
  * Called on app installed
@@ -186,7 +204,7 @@ def parse(String description) {
 			)
 		}
 	} else {
-		def cmd = zwave.parse(description, [0x98: 1, 0x72: 2, 0x85: 2, 0x86: 1])
+		def cmd = zwave.parse(description, commandClassVersions)
 		if (cmd) {
 			result = zwaveEvent(cmd)
 		}
@@ -205,7 +223,7 @@ def parse(String description) {
  */
 def zwaveEvent(physicalgraph.zwave.commands.securityv1.SecurityMessageEncapsulation cmd) {
 	log.trace "[DTH] Executing 'zwaveEvent(physicalgraph.zwave.commands.securityv1.SecurityMessageEncapsulation)' with cmd = $cmd"
-	def encapsulatedCommand = cmd.encapsulatedCommand([0x62: 1, 0x71: 2, 0x80: 1, 0x85: 2, 0x63: 1, 0x98: 1, 0x86: 1])
+	def encapsulatedCommand = cmd.encapsulatedCommand(commandClassVersions)
 	if (encapsulatedCommand) {
 		zwaveEvent(encapsulatedCommand)
 	}
@@ -398,6 +416,103 @@ private def handleBatteryAlarmReport(cmd) {
 			break
 	}
 	result << createEvent(map)
+	result
+}
+
+/**
+ * Responsible for handling AlarmReport commands which are ignored by Access & Burglar handlers
+ *
+ * @param cmd: The AlarmReport command to be parsed
+ *
+ * @return The event(s) to be sent out
+ *
+ */
+private def handleAlarmReportUsingAlarmType(cmd) {
+	log.trace "[DTH] Executing 'handleAlarmReportUsingAlarmType' with cmd = $cmd"
+	def result = []
+	def map = null
+	def deviceName = device.displayName
+	lockCodes = loadLockCodes()
+	switch(cmd.alarmType) {
+		case 9:
+		case 17:
+			map = [ name: "lock", value: "unknown", descriptionText: "Unknown state" ]
+			break
+		case 16: // Note: for levers this means it's unlocked, for non-motorized deadbolt, it's just unsecured and might not get unlocked
+		case 19: // Unlocked with keypad
+			map = [ name: "lock", value: "unlocked" , method: "keypad"]
+			map.descriptionText = "Unlocked by keypad"
+			break
+		case 18: // Locked with keypad
+			codeID = readCodeSlotId(cmd)
+			map = [ name: "lock", value: "locked" ]
+			map.descriptionText = "Locked by keypad"
+			map.data = [ method: "keypad" ]
+			break
+		case 21: // Manually locked
+			map = [ name: "lock", value: "locked", data: [ method: (cmd.alarmLevel == 2) ? "keypad" : "manual" ] ]
+			map.descriptionText = "Locked manually"
+			break
+		case 22: // Manually unlocked
+			map = [ name: "lock", value: "unlocked", data: [ method: "manual" ] ]
+			map.descriptionText = "Unlocked manually"
+			break
+		case 23:
+			map = [ name: "lock", value: "unknown", descriptionText: "Unknown state" ]
+			map.data = [ method: "command" ]
+			break
+		case 24: // Locked by command
+			map = [ name: "lock", value: "locked", data: [ method: "command" ] ]
+			map.descriptionText = "Locked"
+			break
+		case 25: // Unlocked by command
+			map = [ name: "lock", value: "unlocked", data: [ method: "command" ] ]
+			map.descriptionText = "Unlocked"
+			break
+		case 26:
+			map = [ name: "lock", value: "unknown", descriptionText: "Unknown state" ]
+			map.data = [ method: "auto" ]
+			break
+		case 27: // Auto locked
+			map = [ name: "lock", value: "locked", data: [ method: "auto" ] ]
+			map.descriptionText = "Auto locked"
+			break
+		case 130:  // Batteries replaced
+			map = [ descriptionText: "Batteries replaced", isStateChange: true ]
+			break
+		case 161: // Tamper Alarm
+			if (cmd.alarmLevel == 2) {
+				map = [ name: "tamper", value: "detected", descriptionText: "Front escutcheon removed", isStateChange: true ]
+			}
+			break
+		case 167: // Low Battery Alarm
+			if (!state.lastbatt || now() - state.lastbatt > 12*60*60*1000) {
+				map = [ descriptionText: "Battery low", isStateChange: true ]
+				result << response(secure(zwave.batteryV1.batteryGet()))
+			} else {
+				map = [ name: "battery", value: device.currentValue("battery"), descriptionText: "Battery low", isStateChange: true ]
+			}
+			break
+		case 168: // Critical Battery Alarms
+			map = [ name: "battery", value: 1, descriptionText: "Battery level critical", displayed: true ]
+			break
+		case 169: // Battery too low to operate
+			map = [ name: "battery", value: 0, descriptionText: "Battery too low to operate lock", isStateChange: true, displayed: true ]
+			break
+		default:
+			map = [ displayed: false, descriptionText: "Alarm event ${cmd.alarmType} level ${cmd.alarmLevel}" ]
+			break
+	}
+
+	if (map) {
+		if (map.data) {
+			map.data.lockName = deviceName
+		} else {
+			map.data = [ lockName: deviceName ]
+		}
+		result << createEvent(map)
+	}
+	result = result.flatten()
 	result
 }
 

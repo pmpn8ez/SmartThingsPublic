@@ -14,6 +14,7 @@ metadata {
 
         command "reset"
 
+        fingerprint mfr: "010F", prod: "0403", model: "3000"
         fingerprint mfr: "010F", prod: "0403", model: "2000"
         fingerprint mfr: "010F", prod: "0403", model: "1000"
      }
@@ -111,6 +112,7 @@ def reset() {
 
 def refresh() {
     def cmds = []
+    cmds << zwave.switchBinaryV1.switchBinaryGet()
     cmds << zwave.meterV3.meterGet(scale: 0)
     cmds << zwave.meterV3.meterGet(scale: 2)
     encapSequence(cmds,1000)
@@ -124,6 +126,7 @@ def ping() {
 def installed(){
     log.debug "installed()"
     sendEvent(name: "checkInterval", value: 1920, displayed: false, data: [protocol: "zwave", hubHardwareId: device.hub.hardwareID])
+    response(refresh())
 }
 
 //Configuration and synchronization
@@ -307,6 +310,23 @@ def zwaveEvent(physicalgraph.zwave.commands.crc16encapv1.Crc16Encap cmd) {
     }
 }
 
+def zwaveEvent(physicalgraph.zwave.commands.multichannelv3.MultiChannelCmdEncap cmd) {
+    def encapsulatedCommand = cmd.encapsulatedCommand(cmdVersions())
+    if (encapsulatedCommand) {
+        logging("${device.displayName} - Parsed MultiChannelCmdEncap ${encapsulatedCommand}")
+        // this device sometimes sends events encapsulated.
+        if (cmd.sourceEndPoint as Integer == 0) zwaveEvent(encapsulatedCommand)
+        else log.warn "Received a multichannel event from an unsupported channel"
+    } else {
+        log.warn "Unable to extract MultiChannel command from $cmd"
+    }
+}
+
+def zwaveEvent(physicalgraph.zwave.Command cmd) {
+    // Handles all Z-Wave commands we aren't interested in
+    log.debug "Unhandled: ${cmd.toString()}"
+    [:]
+}
 
 private logging(text, type = "debug") {
     if (settings.logging == "true" || type == "warn") {
